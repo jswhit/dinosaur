@@ -1968,6 +1968,80 @@ class SemiLagrangianHybridTest(parameterized.TestCase):
         step_dry(state),
     )
 
+  def test_nodal_humidity_couples_without_spectral_transforms(self):
+    """Nodal humidity enters the hybrid dynamics untruncated.
+
+    The hybrid coupling uses only nodal values of q, so nodal storage must
+    match modal storage for a band-limited q, while grid-scale structure
+    that a modal round trip would remove must still reach the tendencies.
+    """
+    hybrid_levels = hybrid_coordinates.HybridCoordinates.analytic_levels(
+        8, sigma_exponent=1.5, stretch_exponent=0.5
+    )
+    moist, state, _, _ = self._hybrid_setup(
+        hybrid_levels, humidity_key='specific_humidity'
+    )
+    grid = moist.coords.horizontal
+    q_modal = primitive_equations_states.gaussian_scalar(
+        moist.coords, moist.physics_specs, amplitude=0.01
+    )
+    state.tracers = {'specific_humidity': q_modal}
+    nodal_moist = dataclasses.replace(
+        moist, nodal_tracers=('specific_humidity',)
+    )
+    fields = (
+        'vorticity',
+        'divergence',
+        'temperature_variation',
+        'log_surface_pressure',
+    )
+
+    def nodal_tendency(q_nodal):
+      return nodal_moist.nonadvective_terms(
+          state.replace(tracers={'specific_humidity': q_nodal})
+      )
+
+    modal_tendency = moist.nonadvective_terms(state)
+    smooth = nodal_tendency(grid.to_nodal(q_modal))
+    for field in fields:
+      np.testing.assert_allclose(
+          getattr(smooth, field),
+          getattr(modal_tendency, field),
+          atol=1e-6,
+          err_msg=field,
+      )
+    np.testing.assert_array_equal(
+        smooth.tracers['specific_humidity'],
+        jnp.zeros_like(grid.to_nodal(q_modal)),
+    )
+
+    # a checkerboard is not representable at the truncation: a modal round
+    # trip would remove it, so it must change the coupling when nodal.
+    i, j = np.indices(grid.nodal_shape)
+    checkerboard = np.where((i + j) % 2 == 0, 1.5, 0.5).astype(np.float32)
+    q_rough = grid.to_nodal(q_modal) * checkerboard
+    q_truncated = grid.to_nodal(grid.to_modal(q_rough))
+    rough = nodal_tendency(q_rough)
+    truncated = nodal_tendency(q_truncated)
+    difference = np.abs(
+        grid.to_nodal(rough.temperature_variation)
+        - grid.to_nodal(truncated.temperature_variation)
+    ).max()
+    scale = np.abs(grid.to_nodal(smooth.temperature_variation)).max()
+    self.assertGreater(difference, 1e-3 * scale)
+
+    dt = self._nondim_minutes(moist.physics_specs, 30)
+    step = jax.jit(
+        time_integration.semi_lagrangian_crank_nicolson_rk2(nodal_moist, dt)
+    )
+    final = step(state.replace(tracers={'specific_humidity': q_rough}))
+    self.assertTrue(
+        np.isfinite(grid.to_nodal(final.temperature_variation)).all()
+    )
+    self.assertTrue(
+        np.isfinite(np.asarray(final.tracers['specific_humidity'])).all()
+    )
+
   def test_moist_sigma_like_matches_moist_sigma_semi_lagrangian(self):
     """With A = 0 levels, moist hybrid SL matches the moist sigma SL class.
 

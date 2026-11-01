@@ -208,6 +208,18 @@ class NodalVelocities:
   v_mean: Array
 
 
+def _nodal_diagnostic_tracers(
+    tracers: Mapping[str, Array],
+    to_nodal_fn: Callable[[Array], Array],
+    nodal_tracers: Sequence[str],
+) -> dict[str, Array]:
+  """Nodal tracer values; entries in `nodal_tracers` are already nodal."""
+  return {
+      k: v if k in nodal_tracers else to_nodal_fn(v)
+      for k, v in tracers.items()
+  }
+
+
 @jax.named_call
 def compute_diagnostic_state_sigma(
     state: State,
@@ -1813,16 +1825,25 @@ def _semi_lagrangian_nonadvective_terms(
   modal_state, nodal_tracers = _split_nodal_tracers(equation, state)
   dynamics_keys = {equation.humidity_key, *(equation.cloud_keys or ())}
   coupled = {
-      name: equation.coords.horizontal.to_modal(value)
+      name: value
       for name, value in nodal_tracers.items()
       if name in dynamics_keys
   }
-  if coupled:
-    modal_state = modal_state.replace(
-        tracers={**modal_state.tracers, **coupled}
+  kwargs = {}
+  if isinstance(equation, SemiLagrangianPrimitiveEquationsHybrid):
+    # The hybrid dynamics use coupled tracers only as nodal values (virtual
+    # temperature, moist heat capacity), so they pass through nodally and no
+    # spectral round trip truncates them.
+    kwargs['nodal_tracers'] = tuple(coupled)
+  else:
+    # The sigma humidity corrections need modal gradients of q.
+    coupled = jax.tree_util.tree_map(
+        equation.coords.horizontal.to_modal, coupled
     )
   tendency = equation.explicit_nonadvective_terms(
-      modal_state, include_coriolis=equation.coriolis_mode == 'explicit'
+      modal_state.replace(tracers={**modal_state.tracers, **coupled}),
+      include_coriolis=equation.coriolis_mode == 'explicit',
+      **kwargs,
   )
   if equation.terrain_smoothed_log_sp:
     tendency = tendency.replace(
@@ -2019,10 +2040,13 @@ class SemiLagrangianPrimitiveEquations(
       `monotone_tracers` their non-negativity is exact. They must be
       excluded from modal filters (`step_filter_excluding_nodal_tracers`).
       Tracers that enter the dynamics (`humidity_key`, `cloud_keys`) may
-      also be stored nodally: they are converted to modal coefficients
-      once per step where the dynamical coupling terms need them, so the
-      coupling sees the spectrally truncated field while storage and
-      transport stay nodal.
+      also be stored nodally. In sigma coordinates they are converted to
+      modal coefficients once per step for the humidity corrections, which
+      need their gradients, so the coupling sees the spectrally truncated
+      field while storage and transport stay nodal. In hybrid coordinates
+      (`SemiLagrangianPrimitiveEquationsHybrid`) the coupling uses only
+      their nodal values (virtual temperature, moist heat capacity), so
+      they are never transformed to spherical harmonics.
     terrain_smoothed_log_sp: if True (default), transport interpolates the
       smoothed variable `ln pₛ + Φₛ/(R·T̄)` instead of `ln pₛ`, and the
       static field's advection `v̄·∇(Φₛ/(R·T̄))` joins the explicit forcing,
@@ -2278,8 +2302,13 @@ def _get_vertical_discretization_coeffs(
 def compute_diagnostic_state_hybrid(
     state: State,
     coords: coordinate_systems.CoordinateSystem,
+    nodal_tracers: Sequence[str] = (),
 ) -> DiagnosticStateHybrid:
-  """Computes DiagnosticState in nodal basis based on the modal `state`."""
+  """Computes DiagnosticState in nodal basis based on the modal `state`.
+
+  Tracers named in `nodal_tracers` are stored nodally in `state` and are used
+  directly, without a spectral round trip.
+  """
 
   def to_nodal_fn(x):
     return coords.horizontal.to_nodal(x)
@@ -2287,7 +2316,9 @@ def compute_diagnostic_state_hybrid(
   nodal_vorticity = to_nodal_fn(state.vorticity)
   nodal_divergence = to_nodal_fn(state.divergence)
   nodal_temperature_variation = to_nodal_fn(state.temperature_variation)
-  tracers = jax.tree_util.tree_map(to_nodal_fn, state.tracers)
+  tracers = _nodal_diagnostic_tracers(
+      state.tracers, to_nodal_fn, nodal_tracers
+  )
   nodal_cos_lat_u = jax.tree_util.tree_map(
       to_nodal_fn,
       spherical_harmonic.get_cos_lat_vector(
@@ -3250,7 +3281,11 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
 
   @jax.named_call
   def explicit_nonadvective_terms(
-      self, state: State, *, include_coriolis: bool = True
+      self,
+      state: State,
+      *,
+      include_coriolis: bool = True,
+      nodal_tracers: Sequence[str] = (),
   ) -> State:
     """Computes the non-advective part of the explicit tendencies.
 
@@ -3265,11 +3300,15 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
       state: the (modal) state from which to compute tendencies.
       include_coriolis: whether to include the Coriolis term. Semi-Lagrangian
         solvers in planetary-momentum mode absorb it into transport.
+      nodal_tracers: tracers stored nodally in `state`, used directly where
+        the dynamics need them; they get no entry in the returned tendency.
 
     Returns:
       A `State` of non-advective explicit tendencies.
     """
-    aux_state = compute_diagnostic_state_hybrid(state, self.nondim_coords)
+    aux_state = compute_diagnostic_state_hybrid(
+        state, self.nondim_coords, nodal_tracers
+    )
     nodal_surface_pressure = jnp.exp(
         self.coords.horizontal.to_nodal(state.log_surface_pressure)
     )
@@ -3333,7 +3372,11 @@ class PrimitiveEquationsHybrid(PrimitiveEquationsBase):
             + self._implicit_temperature_complement(state)
         ),
         log_surface_pressure=to_modal_fn(log_sp_residual)[jnp.newaxis, ...],
-        tracers=jax.tree_util.tree_map(jnp.zeros_like, state.tracers),
+        tracers={
+            k: jnp.zeros_like(v)
+            for k, v in state.tracers.items()
+            if k not in nodal_tracers
+        },
         sim_time=None if state.sim_time is None else 1.0,
     )
     return self.coords.horizontal.clip_wavenumbers(tendency)
